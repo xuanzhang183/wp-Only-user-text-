@@ -1,0 +1,143 @@
+<?php
+/*
+Plugin Name: Custom Article Filter
+Version:     1.0
+Plugin URI:  https://asrnline.us.kg/
+Description: 用户只能看到他们的文章信息。
+Author:      AsrnLine
+Author URI: https://asrnline.us.kg/
+*/
+
+// 限制普通用户只能查看和管理自己的内容和评论
+function restrict_user_content_and_comments($query) {
+    if (!current_user_can('manage_options') && is_admin()) {
+        global $pagenow;
+        if ('edit.php' === $pagenow || 'upload.php' === $pagenow) {
+            $query->set('author', get_current_user_id());
+        } elseif ('edit-comments.php' === $pagenow) {
+            add_filter('comments_clauses', 'filter_comments_clauses');
+        }
+    }
+}
+add_action('pre_get_posts', 'restrict_user_content_and_comments');
+
+// 过滤评论查询以仅显示对当前用户内容的评论
+function filter_comments_clauses($clauses) {
+    global $wpdb;
+    $user_id = get_current_user_id();
+
+    if (!current_user_can('manage_options')) {
+        $clauses['where'] .= $wpdb->prepare(
+            " AND comment_post_ID IN (SELECT ID FROM {$wpdb->posts} WHERE post_author = %d)",
+            $user_id
+        );
+    }
+
+    return $clauses;
+}
+
+// 显示用户内容或评论数量
+function display_user_content_count() {
+    if (!current_user_can('manage_options')) {
+        $current_screen = get_current_screen();
+        $user_id = get_current_user_id();
+
+        if ($current_screen->base === 'edit-comments') {
+            $count = get_comments(array(
+                'user_id' => $user_id,
+                'count' => true
+            ));
+            echo '<div class="user-content-count">';
+            echo "您共有 {$count} 条评论";
+            echo '</div>';
+        } else {
+            $count = count_user_posts($user_id, $current_screen->post_type);
+            $post_type_obj = get_post_type_object($current_screen->post_type);
+            $post_type_label = $post_type_obj->labels->name;
+            echo '<div class="user-content-count">';
+            echo "您已发布 {$count} 个 {$post_type_label}";
+            echo '</div>';
+        }
+    }
+}
+add_action('edit_form_top', 'display_user_content_count');
+add_action('restrict_manage_comments', 'display_user_content_count');
+
+// 修改内容列表页和评论页的计数
+function modify_content_and_comments_count($views) {
+    if (!current_user_can('manage_options')) {
+        $current_screen = get_current_screen();
+        $user_id = get_current_user_id();
+
+        if ($current_screen->base === 'edit-comments') {
+            $total_count = get_comments(array('user_id' => $user_id, 'count' => true));
+            $approved_count = get_comments(array('user_id' => $user_id, 'status' => 'approve', 'count' => true));
+            $pending_count = get_comments(array('user_id' => $user_id, 'status' => 'hold', 'count' => true));
+
+            $views = array(
+                'all' => sprintf('全部 <span class="count">(%s)</span>', $total_count),
+                'approved' => sprintf('已批准 <span class="count">(%s)</span>', $approved_count),
+                'moderated' => sprintf('待审 <span class="count">(%s)</span>', $pending_count)
+            );
+        } else {
+            $total_count = count_user_posts($user_id, $current_screen->post_type);
+            $published_count = count_user_posts($user_id, $current_screen->post_type, true);
+            $draft_count = $total_count - $published_count;
+
+            $views = array(
+                'all' => sprintf('全部 <span class="count">(%s)</span>', $total_count),
+                'publish' => sprintf('已发布 <span class="count">(%s)</span>', $published_count),
+                'draft' => sprintf('草稿 <span class="count">(%s)</span>', $draft_count)
+            );
+        }
+    }
+    return $views;
+}
+
+// 为所有文章类型和评论添加视图过滤器
+function add_views_filter_for_all_types() {
+    $post_types = get_post_types(array('public' => true));
+    foreach ($post_types as $post_type) {
+        add_filter("views_edit-{$post_type}", 'modify_content_and_comments_count', 10, 1);
+    }
+    add_filter('views_edit-comments', 'modify_content_and_comments_count', 10, 1);
+}
+add_action('admin_init', 'add_views_filter_for_all_types');
+
+// 自定义管理菜单
+function customize_admin_menu() {
+    if (!current_user_can('manage_options')) {
+        global $menu, $submenu;
+        $post_types = get_post_types(array('public' => true), 'objects');
+        foreach ($post_types as $post_type) {
+            $menu_slug = $post_type->name === 'post' ? 'edit.php' : "edit.php?post_type={$post_type->name}";
+            if (isset($submenu[$menu_slug])) {
+                $submenu[$menu_slug][5][0] = '我的' . $post_type->labels->name;
+                if (isset($submenu[$menu_slug][10])) {
+                    $submenu[$menu_slug][10][0] = '添加' . $post_type->labels->singular_name;
+                }
+            }
+        }
+        // 修改评论菜单
+        if (isset($submenu['edit-comments.php'])) {
+            $submenu['edit-comments.php'][0][0] = '我的评论';
+        }
+    }
+}
+add_action('admin_menu', 'customize_admin_menu');
+
+// 添加一个提示，告知用户他们只能看到自己的内容或评论
+function add_user_content_notice() {
+    if (!current_user_can('manage_options') && is_admin()) {
+        $current_screen = get_current_screen();
+        if ($current_screen->base === 'edit-comments') {
+            echo '<div class="notice notice-info"><p>您当前只能查看和管理对您内容的评论。</p></div>';
+        } else {
+            $post_type_obj = get_post_type_object($current_screen->post_type);
+            if ($post_type_obj) {
+                echo '<div class="notice notice-info"><p>您当前只能查看和管理自己的' . $post_type_obj->labels->name . '。</p></div>';
+            }
+        }
+    }
+}
+add_action('admin_notices', 'add_user_content_notice');
