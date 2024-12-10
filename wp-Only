@@ -1,143 +1,278 @@
 <?php
 /*
-Plugin Name: Custom Article Filter
-Version:     1.0
-Plugin URI:  https://asrnline.us.kg/
-Description: 用户只能看到他们的文章信息。
-Author:      AsrnLine
-Author URI: https://asrnline.us.kg/
+Plugin Name: User Content Restriction - Enhanced
+Description: 强化版用户内容限制插件，保留用户自己的内容视图，包括回收站、草稿和待审核列表
+Version: 4.0
+Author: Your Name
 */
 
-// 限制普通用户只能查看和管理自己的内容和评论
-function restrict_user_content_and_comments($query) {
-    if (!current_user_can('manage_options') && is_admin()) {
-        global $pagenow;
-        if ('edit.php' === $pagenow || 'upload.php' === $pagenow) {
-            $query->set('author', get_current_user_id());
-        } elseif ('edit-comments.php' === $pagenow) {
-            add_filter('comments_clauses', 'filter_comments_clauses');
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class UserContentRestriction {
+    private static $instance = null;
+    
+    public static function getInstance() {
+        if (self::$instance === null) {
+            self::$instance = new self();
         }
+        return self::$instance;
     }
-}
-add_action('pre_get_posts', 'restrict_user_content_and_comments');
-
-// 过滤评论查询以仅显示对当前用户内容的评论
-function filter_comments_clauses($clauses) {
-    global $wpdb;
-    $user_id = get_current_user_id();
-
-    if (!current_user_can('manage_options')) {
-        $clauses['where'] .= $wpdb->prepare(
-            " AND comment_post_ID IN (SELECT ID FROM {$wpdb->posts} WHERE post_author = %d)",
-            $user_id
-        );
+    
+    private function __construct() {
+        // 初始化所有钩子
+        $this->initHooks();
     }
-
-    return $clauses;
-}
-
-// 显示用户内容或评论数量
-function display_user_content_count() {
-    if (!current_user_can('manage_options')) {
-        $current_screen = get_current_screen();
+    
+    private function initHooks() {
+        // 文章列表过滤
+        add_filter('views_edit-post', array($this, 'modifyPostViews'));
+        add_action('pre_get_posts', array($this, 'restrictUserPosts'));
+        
+        // 评论列表过滤
+        add_filter('views_edit-comments', array($this, 'modifyCommentViews'));
+        add_filter('comments_clauses', array($this, 'restrictUserComments'), 10, 2);
+        
+        // 统计数据更新
+        add_action('admin_init', array($this, 'updateDashboardStats'));
+        
+        // 媒体库限制
+        add_filter('pre_get_posts', array($this, 'restrictMediaLibrary'));
+        add_filter('ajax_query_attachments_args', array($this, 'restrictAjaxMediaLibrary'));
+        add_filter('wp_count_attachments', array($this, 'updateMediaCount'));
+        add_filter('upload_dir', array($this, 'restrictUploadDir'));
+        add_filter('views_upload', array($this, 'modifyMediaViews'));
+        
+        // 附件访问限制
+        add_action('template_redirect', array($this, 'restrictAttachmentPages'));
+    }
+    
+    // 修改文章列表视图
+    public function modifyPostViews($views) {
+        if (!$this->isRestrictedUser()) {
+            return $views;
+        }
+        
+        $allowed_views = array('mine', 'draft', 'pending', 'trash');
+        return $this->filterViews($views, $allowed_views);
+    }
+    
+    // 限制用户文章查询
+    public function restrictUserPosts($query) {
+        if (!$this->shouldRestrictQuery($query)) {
+            return;
+        }
+        
         $user_id = get_current_user_id();
-
-        if ($current_screen->base === 'edit-comments') {
-            $count = get_comments(array(
-                'user_id' => $user_id,
-                'count' => true
+        $query->set('author', $user_id);
+        
+        // 允许查看所有状态的文章
+        $post_status = $query->get('post_status');
+        if (empty($post_status)) {
+            $query->set('post_status', array(
+                'publish', 'draft', 'pending', 'trash', 'private', 'future'
             ));
-            echo '<div class="user-content-count">';
-            echo "您共有 {$count} 条评论";
-            echo '</div>';
-        } else {
-            $count = count_user_posts($user_id, $current_screen->post_type);
-            $post_type_obj = get_post_type_object($current_screen->post_type);
-            $post_type_label = $post_type_obj->labels->name;
-            echo '<div class="user-content-count">';
-            echo "您已发布 {$count} 个 {$post_type_label}";
-            echo '</div>';
         }
     }
-}
-add_action('edit_form_top', 'display_user_content_count');
-add_action('restrict_manage_comments', 'display_user_content_count');
-
-// 修改内容列表页和评论页的计数
-function modify_content_and_comments_count($views) {
-    if (!current_user_can('manage_options')) {
-        $current_screen = get_current_screen();
+    
+    // 修改评论列表视图
+    public function modifyCommentViews($views) {
+        if (!$this->isRestrictedUser()) {
+            return $views;
+        }
+        
+        $allowed_views = array('moderated', 'spam', 'trash');
+        return $this->filterViews($views, $allowed_views);
+    }
+    
+    // 限制评论查询
+    public function restrictUserComments($clauses, $query) {
+        global $wpdb;
+        
+        if (!$this->isRestrictedUser()) {
+            return $clauses;
+        }
+        
         $user_id = get_current_user_id();
-
-        if ($current_screen->base === 'edit-comments') {
-            $total_count = get_comments(array('user_id' => $user_id, 'count' => true));
-            $approved_count = get_comments(array('user_id' => $user_id, 'status' => 'approve', 'count' => true));
-            $pending_count = get_comments(array('user_id' => $user_id, 'status' => 'hold', 'count' => true));
-
-            $views = array(
-                'all' => sprintf('全部 <span class="count">(%s)</span>', $total_count),
-                'approved' => sprintf('已批准 <span class="count">(%s)</span>', $approved_count),
-                'moderated' => sprintf('待审 <span class="count">(%s)</span>', $pending_count)
-            );
-        } else {
-            $total_count = count_user_posts($user_id, $current_screen->post_type);
-            $published_count = count_user_posts($user_id, $current_screen->post_type, true);
-            $draft_count = $total_count - $published_count;
-
-            $views = array(
-                'all' => sprintf('全部 <span class="count">(%s)</span>', $total_count),
-                'publish' => sprintf('已发布 <span class="count">(%s)</span>', $published_count),
-                'draft' => sprintf('草稿 <span class="count">(%s)</span>', $draft_count)
-            );
+        if (!strpos($clauses['join'], $wpdb->posts)) {
+            $clauses['join'] .= " LEFT JOIN $wpdb->posts ON $wpdb->posts.ID = $wpdb->comments.comment_post_ID";
+        }
+        
+        $clauses['where'] .= $wpdb->prepare(" AND ($wpdb->posts.post_author = %d)", $user_id);
+        return $clauses;
+    }
+    
+    // 更新仪表盘统计
+    public function updateDashboardStats() {
+        if ($this->isRestrictedUser()) {
+            add_filter('wp_count_posts', array($this, 'countUserPosts'), 10, 3);
+            add_filter('wp_count_comments', array($this, 'countUserComments'), 10, 2);
         }
     }
-    return $views;
-}
-
-// 为所有文章类型和评论添加视图过滤器
-function add_views_filter_for_all_types() {
-    $post_types = get_post_types(array('public' => true));
-    foreach ($post_types as $post_type) {
-        add_filter("views_edit-{$post_type}", 'modify_content_and_comments_count', 10, 1);
+    
+    // 计算用户文章数量
+    public function countUserPosts($counts, $type, $perm) {
+        global $wpdb;
+        
+        if (!$this->isRestrictedUser()) {
+            return $counts;
+        }
+        
+        $user_id = get_current_user_id();
+        $results = $wpdb->get_results($wpdb->prepare("
+            SELECT post_status, COUNT(*) as count
+            FROM $wpdb->posts
+            WHERE post_author = %d AND post_type = %s
+            GROUP BY post_status
+        ", $user_id, $type), OBJECT_K);
+        
+        foreach (get_object_vars($counts) as $status => $count) {
+            $counts->$status = isset($results[$status]) ? $results[$status]->count : 0;
+        }
+        
+        return $counts;
     }
-    add_filter('views_edit-comments', 'modify_content_and_comments_count', 10, 1);
-}
-add_action('admin_init', 'add_views_filter_for_all_types');
-
-// 自定义管理菜单
-function customize_admin_menu() {
-    if (!current_user_can('manage_options')) {
-        global $menu, $submenu;
-        $post_types = get_post_types(array('public' => true), 'objects');
-        foreach ($post_types as $post_type) {
-            $menu_slug = $post_type->name === 'post' ? 'edit.php' : "edit.php?post_type={$post_type->name}";
-            if (isset($submenu[$menu_slug])) {
-                $submenu[$menu_slug][5][0] = '我的' . $post_type->labels->name;
-                if (isset($submenu[$menu_slug][10])) {
-                    $submenu[$menu_slug][10][0] = '添加' . $post_type->labels->singular_name;
-                }
+    
+    // 计算用户评论数量
+    public function countUserComments($stats, $post_id) {
+        global $wpdb;
+        
+        if (!$this->isRestrictedUser()) {
+            return $stats;
+        }
+        
+        $user_id = get_current_user_id();
+        $results = $wpdb->get_results($wpdb->prepare("
+            SELECT comment_approved, COUNT(*) as count
+            FROM $wpdb->comments c
+            JOIN $wpdb->posts p ON c.comment_post_ID = p.ID
+            WHERE p.post_author = %d
+            GROUP BY comment_approved
+        ", $user_id), OBJECT_K);
+        
+        foreach ($stats as $status => $count) {
+            $key = ($status === 'total') ? '1' : $status;
+            $stats[$status] = isset($results[$key]) ? $results[$key]->count : 0;
+        }
+        
+        return $stats;
+    }
+    
+    // 限制媒体库查询
+    public function restrictMediaLibrary($query) {
+        if ($this->shouldRestrictMediaQuery($query)) {
+            $query->set('author', get_current_user_id());
+        }
+        return $query;
+    }
+    
+    // 限制媒体库AJAX请求
+    public function restrictAjaxMediaLibrary($query) {
+        if ($this->isRestrictedUser()) {
+            $query['author'] = get_current_user_id();
+        }
+        return $query;
+    }
+    
+    // 更新媒体库计数
+    public function updateMediaCount($counts) {
+        if (!$this->isRestrictedUser()) {
+            return $counts;
+        }
+        
+        global $wpdb;
+        $user_id = get_current_user_id();
+        
+        $results = $wpdb->get_results($wpdb->prepare("
+            SELECT post_mime_type, COUNT(*) as count
+            FROM $wpdb->posts
+            WHERE post_author = %d AND post_type = 'attachment'
+            GROUP BY post_mime_type
+        ", $user_id), OBJECT_K);
+        
+        if (is_object($counts)) {
+            foreach (get_object_vars($counts) as $key => $value) {
+                $counts->$key = isset($results[$key]) ? $results[$key]->count : 0;
             }
         }
-        // 修改评论菜单
-        if (isset($submenu['edit-comments.php'])) {
-            $submenu['edit-comments.php'][0][0] = '我的评论';
+        
+        return $counts;
+    }
+    
+    // 限制上传目录
+    public function restrictUploadDir($uploads) {
+        if (!$this->isRestrictedUser()) {
+            return $uploads;
+        }
+        
+        $user_id = get_current_user_id();
+        $user_dir = '/user-' . $user_id;
+        
+        // 修改上传路径
+        $uploads['path'] = $uploads['basedir'] . $user_dir;
+        $uploads['url'] = $uploads['baseurl'] . $user_dir;
+        
+        // 确保目录存在
+        if (!file_exists($uploads['path'])) {
+            wp_mkdir_p($uploads['path']);
+        }
+        
+        return $uploads;
+    }
+    
+    // 修改媒体库视图
+    public function modifyMediaViews($views) {
+        if (!$this->isRestrictedUser()) {
+            return $views;
+        }
+        
+        $allowed_views = array('uploaded', 'trash');
+        return $this->filterViews($views, $allowed_views);
+    }
+    
+    // 限制附件页面访问
+    public function restrictAttachmentPages() {
+        if (!is_attachment() || !$this->isRestrictedUser()) {
+            return;
+        }
+        
+        $post = get_post();
+        if ($post && $post->post_author != get_current_user_id()) {
+            wp_safe_redirect(home_url(), 403);
+            exit;
         }
     }
-}
-add_action('admin_menu', 'customize_admin_menu');
-
-// 添加一个提示，告知用户他们只能看到自己的内容或评论
-function add_user_content_notice() {
-    if (!current_user_can('manage_options') && is_admin()) {
-        $current_screen = get_current_screen();
-        if ($current_screen->base === 'edit-comments') {
-            echo '<div class="notice notice-info"><p>您当前只能查看和管理对您内容的评论。</p></div>';
-        } else {
-            $post_type_obj = get_post_type_object($current_screen->post_type);
-            if ($post_type_obj) {
-                echo '<div class="notice notice-info"><p>您当前只能查看和管理自己的' . $post_type_obj->labels->name . '。</p></div>';
+    
+    // 辅助方法
+    private function isRestrictedUser() {
+        return is_admin() && !current_user_can('administrator');
+    }
+    
+    private function shouldRestrictQuery($query) {
+        return $this->isRestrictedUser() && 
+               $query->is_main_query() && 
+               in_array($query->get('post_type'), array('post', null));
+    }
+    
+    private function shouldRestrictMediaQuery($query) {
+        return $this->isRestrictedUser() && 
+               isset($query->query['post_type']) && 
+               $query->query['post_type'] === 'attachment';
+    }
+    
+    private function filterViews($views, $allowed_views) {
+        foreach ($views as $key => $view) {
+            if (!in_array($key, $allowed_views)) {
+                unset($views[$key]);
             }
         }
+        return $views;
     }
 }
-add_action('admin_notices', 'add_user_content_notice');
+
+// 初始化插件
+function init_user_content_restriction() {
+    UserContentRestriction::getInstance();
+}
+add_action('init', 'init_user_content_restriction');
